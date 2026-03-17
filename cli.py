@@ -4560,10 +4560,13 @@ class HermesCLI:
         """Handle /update — check for updates, view changelog, or switch versions.
 
         Subcommands:
-            /update            — show status + interactive version picker
+            /update            — show status + subcommand help
+            /update fetch      — fetch remote, show pending commits
+            /update confirm    — pull + reinstall + restart
             /update changelog  — show recent changelog entries
             /update check      — force a fresh update check
-            /update pick       — launch interactive version picker
+            /update list       — list available tagged versions
+            /update switch <t> — switch to a specific tag
 
         All output goes through ``_cprint`` so ANSI colors render correctly
         inside the prompt_toolkit TUI (raw ``print()`` gets mangled by
@@ -4577,6 +4580,7 @@ class HermesCLI:
         # sys.stdout.isatty() returns False under patch_stdout.
         C = "\033[36m"; G = "\033[32m"; Y = "\033[1;33m"
         B = "\033[1m"; D = "\033[2m"; R = "\033[0m"
+        BLU = "\033[34m"
 
         parts = cmd.strip().split(maxsplit=1)
         sub = parts[1].strip().lower() if len(parts) > 1 else ""
@@ -4586,6 +4590,72 @@ class HermesCLI:
         if sub == "changelog":
             self._open_changelog_viewer()
             return
+        elif sub == "fetch":
+            _cprint("")
+            _cprint(f"{C}  → Fetching from origin...{R}")
+            behind = checker.check_now()  # does git fetch + count
+            if behind is None:
+                _cprint(f"{Y}  ⚠ Could not fetch (offline or not a git repo).{R}")
+                _cprint("")
+                return
+            if behind == 0:
+                _cprint(f"{G}  ✓ Already up to date — nothing to pull.{R}")
+                _cprint("")
+                return
+
+            commits_word = "commit" if behind == 1 else "commits"
+            _cprint(f"{Y}  ⬆ {behind} {commits_word} behind origin/main{R}")
+            _cprint("")
+
+            # Show the pending commits
+            from hermes_cli.update_checker import get_pending_commits
+            pending = get_pending_commits(limit=50)
+            if pending:
+                _cprint(f"{C}{B}  Pending changes:{R}")
+                _cprint(f"{D}  {'─' * 56}{R}")
+                _cprint("")
+                for entry in pending:
+                    tag_label = ""
+                    if entry["tag"]:
+                        tag_label = f" {Y}[{entry['tag']}]{R}"
+                    subject = entry["subject"]
+                    if len(subject) > 55:
+                        subject = subject[:52] + "..."
+                    _cprint(f"  {D}{entry['date']}{R}  {BLU}{entry['short_hash']}{R}  {subject}{tag_label}")
+                if len(pending) >= 50:
+                    _cprint(f"{D}  ... and possibly more{R}")
+                _cprint("")
+
+            _cprint(f"{C}  Run {B}/update confirm{R}{C} to pull these changes and restart.{R}")
+            _cprint(f"{D}  Or {B}/update changelog{R}{D} for detailed interactive browsing.{R}")
+            _cprint("")
+        elif sub == "confirm":
+            _cprint("")
+            # Quick check: is there anything to pull?
+            behind = checker.commits_behind
+            if behind == 0:
+                # Maybe they haven't fetched yet — do a quick check
+                _cprint(f"{C}  → Checking for updates...{R}")
+                behind = checker.check_now()
+                if not behind or behind == 0:
+                    _cprint(f"{G}  ✓ Already up to date — nothing to pull.{R}")
+                    _cprint("")
+                    return
+
+            commits_word = "commit" if behind == 1 else "commits"
+            _cprint(f"{C}  → Updating Hermes ({behind} {commits_word})...{R}")
+            _cprint("")
+
+            from hermes_cli.update_checker import perform_update
+            success = perform_update(printer=_cprint)
+
+            if success:
+                _cprint(f"{C}  → Restarting to apply changes...{R}")
+                _cprint("")
+                self._handle_restart()
+            else:
+                _cprint(f"{D}  Update failed. Try running 'hermes update' from the shell.{R}")
+                _cprint("")
         elif sub == "check":
             _cprint("")
             _cprint(f"{C}  → Checking for updates...{R}")
@@ -4593,7 +4663,7 @@ class HermesCLI:
             if behind and behind > 0:
                 commits_word = "commit" if behind == 1 else "commits"
                 _cprint(f"{Y}  ⬆ {behind} {commits_word} behind origin/main{R}")
-                _cprint(f"{D}    Run /update switch <tag> to select a version, or /update changelog to see interactive commit history.{R}")
+                _cprint(f"{D}    Run /update fetch to see what's new, or /update confirm to update now.{R}")
             elif behind == 0:
                 _cprint(f"{G}  ✓ Already up to date!{R}")
             else:
@@ -4649,10 +4719,12 @@ class HermesCLI:
 
             _cprint("")
             _cprint(f"{C}{B}  Subcommands:{R}")
-            _cprint(f"{D}    /update check          Force a fresh update check{R}")
-            _cprint(f"{D}    /update changelog      View interactive commit history{R}")
-            _cprint(f"{D}    /update list           List available tagged versions{R}")
-            _cprint(f"{D}    /update switch <tag>   Switch to a specific version{R}")
+            _cprint(f"{D}    /update fetch           Fetch remote + preview pending commits{R}")
+            _cprint(f"{D}    /update confirm         Pull, reinstall deps, and restart{R}")
+            _cprint(f"{D}    /update check           Force a fresh update check{R}")
+            _cprint(f"{D}    /update changelog       View interactive commit history{R}")
+            _cprint(f"{D}    /update list            List available tagged versions{R}")
+            _cprint(f"{D}    /update switch <tag>    Switch to a specific version{R}")
             _cprint("")
 
     def _handle_skin_command(self, cmd: str):

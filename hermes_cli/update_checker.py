@@ -278,6 +278,180 @@ def get_changelog_entries(limit: int = 50, skip: int = 0) -> List[dict]:
     return entries
 
 
+def get_pending_commits(limit: int = 100) -> List[dict]:
+    """Get commits between HEAD and origin/main (what would be pulled).
+
+    Returns a list of dicts with keys: hash, short_hash, date, author, subject, tag.
+    Only returns commits that are on origin/main but not yet on HEAD.
+    """
+    repo_dir = _get_repo_dir()
+    if repo_dir is None:
+        return []
+
+    fmt = "%H|%h|%ai|%an|%s|%D"
+    args = [
+        "log", "--format=" + fmt,
+        f"--max-count={limit}",
+        "--date-order",
+        "HEAD..origin/main",
+    ]
+    log_output = _git(args, repo_dir, timeout=15)
+    if not log_output:
+        return []
+
+    entries = []
+    for line in log_output.splitlines():
+        parts = line.split("|", 5)
+        if len(parts) < 6:
+            continue
+        full_hash, short_hash, date, author, subject, refs = parts
+
+        tag = None
+        if refs:
+            for ref_part in refs.split(","):
+                ref_part = ref_part.strip()
+                if ref_part.startswith("tag:"):
+                    tag = ref_part[4:].strip()
+                    break
+
+        entries.append({
+            "hash": full_hash,
+            "short_hash": short_hash,
+            "date": date[:10],
+            "author": author,
+            "subject": subject,
+            "tag": tag,
+        })
+
+    return entries
+
+
+def perform_update(printer=None) -> bool:
+    """Pull latest changes from origin and reinstall dependencies.
+
+    This is the in-CLI equivalent of ``hermes update``.  It:
+      1. Determines the current branch (falls back to main).
+      2. Stashes local changes if any.
+      3. Pulls from origin.
+      4. Reinstalls Python (and optionally Node) dependencies.
+      5. Syncs bundled skills.
+
+    Args:
+        printer: Callable to output a line.  Pass ``_cprint`` when inside
+                 the prompt_toolkit TUI.  Defaults to ``print``.
+
+    Returns True on success, False on failure.
+    """
+    import shutil
+    import sys
+
+    C = "\033[36m"; G = "\033[32m"; Y = "\033[33m"
+    RED = "\033[31m"; B = "\033[1m"; R = "\033[0m"
+    out = printer or print
+
+    repo_dir = _get_repo_dir()
+    if repo_dir is None:
+        out(f"{RED}  ✗ Cannot find hermes-agent git repository.{R}")
+        return False
+
+    git_cmd = ["git"]
+    if sys.platform == "win32":
+        git_cmd = ["git", "-c", "windows.appendAtomically=false"]
+
+    # Determine branch
+    result = subprocess.run(
+        git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=str(repo_dir), capture_output=True, text=True,
+    )
+    branch = result.stdout.strip() if result.returncode == 0 else "main"
+
+    # Verify remote branch exists
+    verify = subprocess.run(
+        git_cmd + ["rev-parse", "--verify", f"origin/{branch}"],
+        cwd=str(repo_dir), capture_output=True, text=True,
+    )
+    if verify.returncode != 0:
+        branch = "main"
+
+    # Stash local changes
+    stash_output = _git(["stash", "--include-untracked"], repo_dir)
+    stashed = stash_output and stash_output != "No local changes to save"
+    if stashed:
+        out(f"{G}  ✓ Stashed local changes{R}")
+
+    # Pull
+    out(f"{C}  → Pulling updates from origin/{branch}...{R}")
+    pull_result = subprocess.run(
+        git_cmd + ["pull", "origin", branch],
+        cwd=str(repo_dir), capture_output=True, text=True,
+    )
+    if pull_result.returncode != 0:
+        out(f"{RED}  ✗ Pull failed: {pull_result.stderr.strip()}{R}")
+        if stashed:
+            _git(["stash", "pop"], repo_dir)
+        return False
+    out(f"{G}  ✓ Code updated{R}")
+
+    # Restore stash
+    if stashed:
+        pop_result = _git(["stash", "pop"], repo_dir)
+        if pop_result and "CONFLICT" in pop_result:
+            out(f"{Y}  ⚠ Stash pop had conflicts — resolve manually{R}")
+        else:
+            out(f"{G}  ✓ Local changes restored{R}")
+
+    # Reinstall Python dependencies
+    out(f"{C}  → Updating Python dependencies...{R}")
+    uv_bin = shutil.which("uv")
+    try:
+        if uv_bin:
+            subprocess.run(
+                [uv_bin, "pip", "install", "-e", ".", "--quiet"],
+                cwd=str(repo_dir), check=True,
+                env={**os.environ, "VIRTUAL_ENV": str(repo_dir / "venv")},
+            )
+        else:
+            venv_pip = repo_dir / "venv" / ("Scripts" if sys.platform == "win32" else "bin") / "pip"
+            if venv_pip.exists():
+                subprocess.run([str(venv_pip), "install", "-e", ".", "--quiet"],
+                               cwd=str(repo_dir), check=True)
+            else:
+                subprocess.run(["pip", "install", "-e", ".", "--quiet"],
+                               cwd=str(repo_dir), check=True)
+        out(f"{G}  ✓ Dependencies updated{R}")
+    except subprocess.CalledProcessError as e:
+        out(f"{Y}  ⚠ Dependency install failed: {e}{R}")
+
+    # Node deps
+    if (repo_dir / "package.json").exists():
+        npm_bin = shutil.which("npm")
+        if npm_bin:
+            out(f"{C}  → Updating Node.js dependencies...{R}")
+            subprocess.run([npm_bin, "install", "--silent"],
+                           cwd=str(repo_dir), check=False)
+
+    # Sync skills
+    try:
+        from tools.skills_sync import sync_skills
+        out(f"{C}  → Syncing bundled skills...{R}")
+        sync_result = sync_skills(quiet=True)
+        if sync_result["copied"] or sync_result.get("updated"):
+            copied = sync_result["copied"]
+            updated = sync_result.get("updated", [])
+            if copied:
+                out(f"{G}  + {len(copied)} new skill(s){R}")
+            if updated:
+                out(f"{G}  ↑ {len(updated)} updated skill(s){R}")
+        else:
+            out(f"{G}  ✓ Skills up to date{R}")
+    except Exception:
+        pass
+
+    out("")
+    out(f"{G}{B}  ✓ Update complete!{R}")
+    return True
+
+
 def get_available_versions(limit: int = 30) -> List[dict]:
     """Get available tagged versions from the repo.
 
