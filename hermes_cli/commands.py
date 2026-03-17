@@ -112,6 +112,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True),
     CommandDef("update", "Update Hermes Agent to the latest version", "Info",
                gateway_only=True),
+    CommandDef("restart", "Restart Hermes and resume the current session", "Session",
+               cli_only=True),
 
     # Exit
     CommandDef("quit", "Exit the CLI", "Exit",

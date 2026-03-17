@@ -2834,6 +2834,36 @@ class HermesCLI:
                 example_model = other_models[0][0]
                 print(f"  Example: /model {other['id']}:{example_model}")
 
+    def _handle_restart(self):
+        """Restart the Hermes CLI process, resuming the current session.
+
+        Saves conversation state, then replaces the current process with
+        a fresh ``hermes --resume <session_id>`` invocation so the user
+        lands right back in the same conversation.
+        """
+        import shutil
+
+        # Persist current conversation before replacing the process
+        if self.agent:
+            try:
+                self.agent.persist_session()
+            except Exception:
+                pass
+
+        session_id = self.session_id
+        _cprint(f"  ↻ Restarting Hermes (session: {session_id})...")
+
+        hermes_bin = shutil.which("hermes")
+        if hermes_bin:
+            os.execvp(hermes_bin, ["hermes", "--resume", session_id])
+        else:
+            # Fallback: re-invoke via python -m
+            import sys
+            os.execvp(
+                sys.executable,
+                [sys.executable, "-m", "hermes_cli.main", "--resume", session_id],
+            )
+
     def _handle_prompt_command(self, cmd: str):
         """Handle the /prompt command to view or set system prompt."""
         parts = cmd.split(maxsplit=1)
@@ -3276,6 +3306,9 @@ class HermesCLI:
         
         if canonical in ("quit", "exit", "q"):
             return False
+        elif canonical == "restart":
+            self._handle_restart()
+            return True  # won't reach here after execvp, but just in case
         elif canonical == "help":
             self.show_help()
         elif canonical == "tools":
