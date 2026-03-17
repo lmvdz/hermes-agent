@@ -126,20 +126,33 @@ def get_available_skills() -> Dict[str, List[str]]:
 # Update check
 # =========================================================================
 
-# Cache update check results for 6 hours to avoid repeated git fetches
+# Cache update check results — interval is configurable via config.yaml
+# (update.check_interval).  The old 6-hour default is kept as a fallback.
 _UPDATE_CHECK_CACHE_SECONDS = 6 * 3600
+
+
+def _get_update_check_interval() -> int:
+    """Read update.check_interval from config.yaml, falling back to 6 hours."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        interval = cfg.get("update", {}).get("check_interval", _UPDATE_CHECK_CACHE_SECONDS)
+        return max(60, int(interval)) if interval else _UPDATE_CHECK_CACHE_SECONDS
+    except Exception:
+        return _UPDATE_CHECK_CACHE_SECONDS
 
 
 def check_for_updates() -> Optional[int]:
     """Check how many commits behind origin/main the local repo is.
 
-    Does a ``git fetch`` at most once every 6 hours (cached to
+    Does a ``git fetch`` at most once per configured interval (cached to
     ``~/.hermes/.update_check``).  Returns the number of commits behind,
     or ``None`` if the check fails or isn't applicable.
     """
     hermes_home = get_hermes_home()
     repo_dir = hermes_home / "hermes-agent"
     cache_file = hermes_home / ".update_check"
+    cache_seconds = _get_update_check_interval()
 
     # Must be a git repo — fall back to project root for dev installs
     if not (repo_dir / ".git").exists():
@@ -152,7 +165,7 @@ def check_for_updates() -> Optional[int]:
     try:
         if cache_file.exists():
             cached = json.loads(cache_file.read_text())
-            if now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS:
+            if now - cached.get("ts", 0) < cache_seconds:
                 return cached.get("behind")
     except Exception:
         pass

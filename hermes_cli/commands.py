@@ -133,8 +133,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, aliases=("gateway",)),
     CommandDef("paste", "Check clipboard for an image and attach it", "Info",
                cli_only=True),
-    CommandDef("update", "Update Hermes Agent to the latest version", "Info",
-               gateway_only=True),
+    CommandDef("update", "Check for updates, browse changelog, or switch versions", "Info"),
 
     # Exit
     CommandDef("quit", "Exit the CLI", "Exit",

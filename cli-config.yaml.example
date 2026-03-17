@@ -790,6 +790,14 @@ display:
   skin: default
 
 # =============================================================================
+# Update Checking
+# =============================================================================
+# update:
+#   # Seconds between background update checks (default: 3600 = 1 hour).
+#   # A status bar indicator appears when a new version is available.
+#   # Set to 0 to disable automatic checking. Minimum effective value: 60.
+#   check_interval: 3600
+
 # Privacy
 # =============================================================================
 # privacy:

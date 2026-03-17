@@ -22,6 +22,7 @@ from hermes_cli.commands import (
 )
 
 
+
 def _completions(completer: SlashCommandCompleter, text: str):
     return list(
         completer.get_completions(

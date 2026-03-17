@@ -1497,6 +1497,18 @@ class HermesCLI:
                         ("class:status-bar", " "),
                     ]
 
+            # Update available indicator
+            try:
+                from hermes_cli.update_checker import get_update_checker
+                checker = get_update_checker()
+                if checker.update_available:
+                    frags.extend([
+                        ("class:status-bar-dim", " │ "),
+                        ("class:status-bar-update", "⬆ update"),
+                    ])
+            except Exception:
+                pass
+
             total_width = sum(self._status_bar_display_width(text) for _, text in frags)
             if total_width > width:
                 plain_text = "".join(text for _, text in frags)
@@ -3954,6 +3966,8 @@ class HermesCLI:
             self._handle_skin_command(cmd_original)
         elif canonical == "voice":
             self._handle_voice_command(cmd_original)
+        elif cmd_lower.startswith("/update"):
+            self._handle_update_command(cmd_original)
         else:
             # Check for user-defined quick commands (bypass agent loop, no LLM call)
             base_cmd = cmd_lower.split()[0]
@@ -4541,6 +4555,105 @@ class HermesCLI:
             print("   disconnect   Revert to default browser backend")
             print("   status       Show current browser mode")
             print()
+
+    def _handle_update_command(self, cmd: str):
+        """Handle /update — check for updates, view changelog, or switch versions.
+
+        Subcommands:
+            /update            — show status + interactive version picker
+            /update changelog  — show recent changelog entries
+            /update check      — force a fresh update check
+            /update pick       — launch interactive version picker
+
+        All output goes through ``_cprint`` so ANSI colors render correctly
+        inside the prompt_toolkit TUI (raw ``print()`` gets mangled by
+        patch_stdout's StdoutProxy).
+        """
+        from hermes_cli.update_checker import (
+            get_update_checker, show_changelog, checkout_version,
+        )
+
+        # Raw ANSI codes — color() won't work inside the TUI because
+        # sys.stdout.isatty() returns False under patch_stdout.
+        C = "\033[36m"; G = "\033[32m"; Y = "\033[1;33m"
+        B = "\033[1m"; D = "\033[2m"; R = "\033[0m"
+
+        parts = cmd.strip().split(maxsplit=1)
+        sub = parts[1].strip().lower() if len(parts) > 1 else ""
+
+        checker = get_update_checker()
+
+        if sub == "changelog":
+            self._open_changelog_viewer()
+            return
+        elif sub == "check":
+            _cprint("")
+            _cprint(f"{C}  → Checking for updates...{R}")
+            behind = checker.check_now()
+            if behind and behind > 0:
+                commits_word = "commit" if behind == 1 else "commits"
+                _cprint(f"{Y}  ⬆ {behind} {commits_word} behind origin/main{R}")
+                _cprint(f"{D}    Run /update switch <tag> to select a version, or /update changelog to see interactive commit history.{R}")
+            elif behind == 0:
+                _cprint(f"{G}  ✓ Already up to date!{R}")
+            else:
+                _cprint(f"{Y}  ⚠ Could not check for updates (offline or not a git repo).{R}")
+            _cprint("")
+        elif sub == "list":
+            from hermes_cli.update_checker import get_available_versions
+            versions = get_available_versions(limit=30)
+            if not versions:
+                _cprint(f"{D}  No tagged versions found in the repository.{R}")
+                _cprint(f"{D}  Tip: run 'hermes update' from the shell to pull the latest.{R}")
+                _cprint(f"{D}  Tip: run `/update changelog` to see interactive commit history")
+                _cprint("")
+            else:
+                _cprint("")
+                _cprint(f"{C}{B}  Available versions:{R}")
+                _cprint("")
+                for v in versions:
+                    marker = f"{G} ← current{R}" if v["is_current"] else ""
+                    subj = v["subject"]
+                    if len(subj) > 50:
+                        subj = subj[:47] + "..."
+                    _cprint(f"  {B}{v['tag']:<24}{R} {D}{v['date']}{R}  {subj}{marker}")
+                _cprint("")
+                _cprint(f"{D}  To switch: /update switch <tag>{R}")
+                _cprint(f"{D}  Example:   /update switch v2026.3.12{R}")
+                _cprint("")
+        elif sub.startswith("switch"):
+            switch_parts = sub.split(maxsplit=1)
+            if len(switch_parts) < 2 or not switch_parts[1].strip():
+                _cprint(f"{Y}  Usage: /update switch <tag>{R}")
+                _cprint(f"{D}  Run /update list to see available tagged versions.{R}")
+                _cprint("")
+            else:
+                tag = switch_parts[1].strip()
+                _cprint("")
+                _cprint(f"{C}  → Switching to {tag}...{R}")
+                success = checkout_version(tag, printer=_cprint)
+                if not success:
+                    _cprint(f"{D}  Run /update list to see available tagged versions.{R}")
+                _cprint("")
+        else:
+            _cprint("")
+            behind = checker.commits_behind
+            if behind > 0:
+                commits_word = "commit" if behind == 1 else "commits"
+                _cprint(f"{Y}  ⬆ Update available: {behind} {commits_word} behind{R}")
+                latest = checker.latest_tag
+                if latest:
+                    _cprint(f"{D}  Latest tag: {latest}{R}")
+            else:
+                _cprint(f"{G}  ✓ Up to date (or no check performed yet){R}")
+
+            _cprint("")
+            _cprint(f"{C}{B}  Subcommands:{R}")
+            _cprint(f"{D}    /update check          Force a fresh update check{R}")
+            _cprint(f"{D}    /update changelog      View interactive commit history{R}")
+            _cprint(f"{D}    /update list           List available tagged versions{R}")
+            _cprint(f"{D}    /update switch <tag>   Switch to a specific version{R}")
+            _cprint("")
 
     def _handle_skin_command(self, cmd: str):
         """Handle /skin [name] — show or change the display skin."""
@@ -5685,6 +5798,442 @@ class HermesCLI:
         lines.append(('class:approval-border', '╰' + ('─' * box_width) + '╯\n'))
         return lines
 
+    # ── Interactive changelog viewer ─────────────────────────────────────
+
+    _CHANGELOG_PAGE_SIZE = 50
+    _CHANGELOG_LOAD_THRESHOLD = 10  # load more when cursor is within N entries of edge
+
+    def _open_changelog_viewer(self):
+        """Activate the interactive changelog panel."""
+        from hermes_cli.update_checker import get_changelog_entries
+
+        entries = get_changelog_entries(limit=self._CHANGELOG_PAGE_SIZE, skip=0)
+        if not entries:
+            _cprint("  No changelog entries found.")
+            return
+
+        self._changelog_state = {
+            "entries": entries,
+            "scroll_offset": 0,
+            "cursor": 0,
+            "mode": "list",       # "list" or "detail"
+            "detail": None,       # commit detail dict when in detail mode
+            "detail_scroll": 0,   # scroll offset within detail view
+            "active_btn": 0,      # 0 = Back, 1 = Checkout
+            "loaded_count": len(entries),     # total entries loaded so far
+            "exhausted": len(entries) < self._CHANGELOG_PAGE_SIZE,  # no more to load
+            "loading": False,     # prevent concurrent loads
+        }
+        self._invalidate(min_interval=0)
+
+    def _close_changelog_viewer(self):
+        """Dismiss the interactive changelog panel."""
+        self._changelog_state = None
+        self._invalidate(min_interval=0)
+
+    def _changelog_move_cursor(self, delta: int):
+        """Move the cursor by delta lines and auto-scroll to keep it visible."""
+        state = self._changelog_state
+        if not state or state["mode"] != "list":
+            return
+        entries = state["entries"]
+        old_cursor = state["cursor"]
+        state["cursor"] = max(0, min(len(entries) - 1, old_cursor + delta))
+
+        # Auto-scroll to keep cursor visible
+        term_rows = shutil.get_terminal_size((100, 20)).lines
+        visible_rows = max(5, min(term_rows - 8, 25))
+        if state["cursor"] < state["scroll_offset"]:
+            state["scroll_offset"] = state["cursor"]
+        elif state["cursor"] >= state["scroll_offset"] + visible_rows:
+            state["scroll_offset"] = state["cursor"] - visible_rows + 1
+
+        # Infinite scroll: load more when near bottom edge
+        distance_from_bottom = len(entries) - 1 - state["cursor"]
+        if distance_from_bottom < self._CHANGELOG_LOAD_THRESHOLD:
+            self._changelog_load_more()
+
+        self._invalidate(min_interval=0)
+
+    def _changelog_load_more(self):
+        """Load the next page of changelog entries (called near bottom edge)."""
+        state = self._changelog_state
+        if not state or state["exhausted"] or state["loading"]:
+            return
+        state["loading"] = True
+        try:
+            from hermes_cli.update_checker import get_changelog_entries
+            skip = state["loaded_count"]
+            new_entries = get_changelog_entries(limit=self._CHANGELOG_PAGE_SIZE, skip=skip)
+            if not new_entries:
+                state["exhausted"] = True
+            else:
+                # Deduplicate by hash (safety)
+                existing_hashes = {e["hash"] for e in state["entries"]}
+                added = [e for e in new_entries if e["hash"] not in existing_hashes]
+                state["entries"].extend(added)
+                state["loaded_count"] = skip + len(new_entries)
+                if len(new_entries) < self._CHANGELOG_PAGE_SIZE:
+                    state["exhausted"] = True
+        finally:
+            state["loading"] = False
+
+    def _changelog_scroll(self, delta: int):
+        """Scroll the changelog by delta lines (positive = down)."""
+        state = self._changelog_state
+        if not state:
+            return
+        if state["mode"] == "detail":
+            # Scroll the detail view
+            state["detail_scroll"] = max(0, state["detail_scroll"] + delta)
+            self._invalidate(min_interval=0)
+            return
+        entries = state["entries"]
+        max_offset = max(0, len(entries) - 1)
+        state["scroll_offset"] = max(0, min(max_offset, state["scroll_offset"] + delta))
+        # Keep cursor within visible range
+        term_rows = shutil.get_terminal_size((100, 20)).lines
+        visible_rows = max(5, min(term_rows - 8, 25))
+        if state["cursor"] < state["scroll_offset"]:
+            state["cursor"] = state["scroll_offset"]
+        elif state["cursor"] >= state["scroll_offset"] + visible_rows:
+            state["cursor"] = state["scroll_offset"] + visible_rows - 1
+        # Infinite scroll on scroll too
+        distance_from_bottom = len(entries) - 1 - state["cursor"]
+        if distance_from_bottom < self._CHANGELOG_LOAD_THRESHOLD:
+            self._changelog_load_more()
+        self._invalidate(min_interval=0)
+
+    def _changelog_open_detail(self):
+        """Open the detail view for the currently selected commit."""
+        state = self._changelog_state
+        if not state or state["mode"] != "list":
+            return
+        entry = state["entries"][state["cursor"]]
+        from hermes_cli.update_checker import get_commit_detail
+        detail = get_commit_detail(entry["short_hash"])
+        if not detail:
+            return
+        state["mode"] = "detail"
+        state["detail"] = detail
+        state["detail_scroll"] = 0
+        state["active_btn"] = 0
+        self._invalidate(min_interval=0)
+
+    def _changelog_close_detail(self):
+        """Return from detail view to list view."""
+        state = self._changelog_state
+        if not state:
+            return
+        state["mode"] = "list"
+        state["detail"] = None
+        state["detail_scroll"] = 0
+        state["active_btn"] = 0
+        self._invalidate(min_interval=0)
+
+    def _changelog_toggle_btn(self):
+        """Toggle between Back and Checkout buttons in detail view."""
+        state = self._changelog_state
+        if not state or state["mode"] != "detail":
+            return
+        state["active_btn"] = 1 - state["active_btn"]
+        self._invalidate(min_interval=0)
+
+    def _changelog_activate_btn(self):
+        """Activate the currently selected button in detail view."""
+        state = self._changelog_state
+        if not state or state["mode"] != "detail":
+            return
+        if state["active_btn"] == 0:
+            # Back
+            self._changelog_close_detail()
+        else:
+            # Checkout
+            detail = state["detail"]
+            if detail:
+                commit_hash = detail["hash"]
+                repo_dir = detail.get("repo_dir", "")
+                self._close_changelog_viewer()
+                from hermes_cli.update_checker import checkout_version
+                checkout_version(commit_hash, printer=_cprint)
+
+    def _get_changelog_display_fragments(self):
+        """Render the interactive changelog panel for the prompt_toolkit UI."""
+        from prompt_toolkit.mouse_events import MouseEventType
+
+        state = self._changelog_state
+        if not state:
+            return []
+
+        if state["mode"] == "detail":
+            return self._get_changelog_detail_fragments()
+
+        entries = state["entries"]
+        scroll_offset = state["scroll_offset"]
+        cursor = state["cursor"]
+
+        term_cols = shutil.get_terminal_size((100, 20)).columns
+        term_rows = shutil.get_terminal_size((100, 20)).lines
+
+        # Panel sizing
+        box_width = min(max(60, term_cols - 6), 90)
+        inner_width = box_width - 4  # padding inside borders
+        visible_rows = max(5, min(term_rows - 8, 25))
+
+        # Mouse handler for scroll wheel — attached to every fragment
+        def _mouse(mouse_event):
+            if mouse_event.event_type == MouseEventType.SCROLL_UP:
+                self._changelog_scroll(-3)
+                return None  # consumed
+            elif mouse_event.event_type == MouseEventType.SCROLL_DOWN:
+                self._changelog_scroll(3)
+                return None  # consumed
+            return NotImplemented
+
+        lines = []
+        border = 'class:changelog-border'
+        title_style = 'class:changelog-title'
+        date_style = 'class:changelog-date'
+        hash_style = 'class:changelog-hash'
+        subject_style = 'class:changelog-subject'
+        tag_style = 'class:changelog-tag'
+        hint_style = 'class:changelog-hint'
+        scrollbar_style = 'class:changelog-scrollbar'
+        scrollbar_thumb = 'class:changelog-scrollbar-thumb'
+        cursor_style = 'class:changelog-cursor'
+
+        def _f(style, text):
+            """Fragment with mouse handler."""
+            return (style, text, _mouse)
+
+        # Top border
+        title = " Changelog (origin/main) "
+        pad_left = max(1, (box_width - len(title)) // 2)
+        pad_right = max(1, box_width - pad_left - len(title))
+        lines.append(_f(border, '╭' + '─' * pad_left))
+        lines.append(_f(title_style, title))
+        lines.append(_f(border, '─' * pad_right + '╮\n'))
+
+        # Hint line
+        hint = "↑↓ navigate  Enter select  Esc close"
+        hint_padded = hint[:inner_width].center(inner_width)
+        lines.append(_f(border, '│ '))
+        lines.append(_f(hint_style, hint_padded))
+        lines.append(_f(border, ' │\n'))
+
+        # Separator
+        lines.append(_f(border, '├' + '─' * (box_width) + '┤\n'))
+
+        # Scrollbar computation
+        total = len(entries)
+        if total > visible_rows:
+            thumb_size = max(1, visible_rows * visible_rows // total)
+            thumb_pos = scroll_offset * (visible_rows - thumb_size) // max(1, total - visible_rows)
+        else:
+            thumb_size = visible_rows
+            thumb_pos = 0
+
+        # Entry lines
+        end_idx = min(scroll_offset + visible_rows, total)
+        for draw_i, i in enumerate(range(scroll_offset, end_idx)):
+            entry = entries[i]
+            date_str = entry["date"]
+            hash_str = entry["short_hash"]
+            subject = entry["subject"]
+            tag = entry["tag"]
+            is_cursor = (i == cursor)
+
+            # Compute available space for subject
+            # Format: "  YYYY-MM-DD  abcdef0  subject [tag]  "
+            prefix_len = 2 + 10 + 2 + 7 + 2  # "  date  hash  "
+            tag_len = len(f" [{tag}]") if tag else 0
+            max_subject_len = max(10, inner_width - prefix_len - tag_len)
+            if len(subject) > max_subject_len:
+                subject = subject[:max_subject_len - 3] + "..."
+
+            # Pad to fill the line
+            used = 1 + 10 + 2 + 7 + 2 + len(subject) + tag_len
+            remaining = max(0, inner_width - used)
+            tag_text = f" [{tag}]" if tag else ""
+            row_text = f" {date_str}  {hash_str}  {subject}{tag_text}" + " " * remaining
+
+            if is_cursor:
+                # Render entire row in cursor highlight style
+                lines.append(_f(border, '│ '))
+                lines.append(_f(cursor_style, row_text))
+            else:
+                lines.append(_f(border, '│ '))
+                lines.append(_f(date_style, f" {date_str}"))
+                lines.append(_f('', '  '))
+                lines.append(_f(hash_style, hash_str))
+                lines.append(_f('', '  '))
+                lines.append(_f(subject_style, subject))
+                if tag:
+                    lines.append(_f(tag_style, f" [{tag}]"))
+                lines.append(_f('', ' ' * remaining))
+
+            # Scrollbar gutter
+            if thumb_pos <= draw_i < thumb_pos + thumb_size:
+                lines.append(_f(scrollbar_thumb, '┃'))
+            else:
+                lines.append(_f(scrollbar_style, '│'))
+            lines.append(_f('', '\n'))
+
+        # Pad remaining rows if fewer entries than visible_rows
+        for draw_i in range(end_idx - scroll_offset, visible_rows):
+            lines.append(_f(border, '│'))
+            lines.append(_f('', ' ' * inner_width))
+            lines.append(_f('', ' '))
+            if thumb_pos <= draw_i < thumb_pos + thumb_size:
+                lines.append(_f(scrollbar_thumb, '┃'))
+            else:
+                lines.append(_f(scrollbar_style, '│'))
+            lines.append(_f('', '\n'))
+
+        # Bottom border with position indicator
+        exhausted = state.get("exhausted", False)
+        suffix = "" if exhausted else "+"
+        pos_text = f" {cursor + 1} of {total}{suffix} "
+        pad_left = max(1, (box_width - len(pos_text)) // 2)
+        pad_right = max(1, box_width - pad_left - len(pos_text))
+        lines.append(_f(border, '╰' + '─' * pad_left))
+        lines.append(_f(hint_style, pos_text))
+        lines.append(_f(border, '─' * pad_right + '╯\n'))
+
+        return lines
+
+    def _get_changelog_detail_fragments(self):
+        """Render the commit detail view for the prompt_toolkit UI."""
+        from prompt_toolkit.mouse_events import MouseEventType
+
+        state = self._changelog_state
+        detail = state["detail"]
+        if not detail:
+            return []
+
+        detail_scroll = state["detail_scroll"]
+        active_btn = state["active_btn"]
+
+        term_cols = shutil.get_terminal_size((100, 20)).columns
+        term_rows = shutil.get_terminal_size((100, 20)).lines
+
+        box_width = min(max(60, term_cols - 6), 90)
+        inner_width = box_width - 4
+        visible_rows = max(5, min(term_rows - 10, 22))
+
+        def _mouse(mouse_event):
+            if mouse_event.event_type == MouseEventType.SCROLL_UP:
+                self._changelog_scroll(-3)
+                return None
+            elif mouse_event.event_type == MouseEventType.SCROLL_DOWN:
+                self._changelog_scroll(3)
+                return None
+            return NotImplemented
+
+        lines = []
+        border = 'class:changelog-border'
+        title_style = 'class:changelog-title'
+        hint_style = 'class:changelog-hint'
+        label_style = 'class:changelog-detail-label'
+        value_style = 'class:changelog-detail-value'
+        body_style = 'class:changelog-subject'
+        btn_active = 'class:changelog-btn-active'
+        btn_inactive = 'class:changelog-btn-inactive'
+
+        def _f(style, text):
+            return (style, text, _mouse)
+
+        # Top border
+        title = " Commit Detail "
+        pad_left = max(1, (box_width - len(title)) // 2)
+        pad_right = max(1, box_width - pad_left - len(title))
+        lines.append(_f(border, '╭' + '─' * pad_left))
+        lines.append(_f(title_style, title))
+        lines.append(_f(border, '─' * pad_right + '╮\n'))
+
+        # Build content lines for the detail body
+        content_lines = []
+        content_lines.append(("  Hash:    ", detail["hash"]))
+        content_lines.append(("  Author:  ", detail["author"]))
+        content_lines.append(("  Date:    ", detail["date"]))
+        content_lines.append(("", ""))
+        content_lines.append(("  ", detail["subject"]))
+        if detail.get("body"):
+            content_lines.append(("", ""))
+            for bline in detail["body"].split("\n"):
+                content_lines.append(("  ", bline))
+        if detail.get("stats"):
+            content_lines.append(("", ""))
+            content_lines.append(("  ", "─" * min(inner_width - 4, 50)))
+            for sline in detail["stats"].split("\n"):
+                content_lines.append(("  ", sline))
+
+        # Clamp detail_scroll
+        max_scroll = max(0, len(content_lines) - visible_rows)
+        if detail_scroll > max_scroll:
+            state["detail_scroll"] = max_scroll
+            detail_scroll = max_scroll
+
+        # Render visible content lines
+        end_idx = min(detail_scroll + visible_rows, len(content_lines))
+        for draw_i in range(visible_rows):
+            ci = detail_scroll + draw_i
+            lines.append(_f(border, '│ '))
+            if ci < len(content_lines):
+                lbl, val = content_lines[ci]
+                text = (lbl + val)[:inner_width]
+                pad = inner_width - len(text)
+                if lbl and lbl.strip().endswith(":"):
+                    lines.append(_f(label_style, lbl))
+                    lines.append(_f(value_style, val[:inner_width - len(lbl)]))
+                    pad = inner_width - len(lbl) - len(val[:inner_width - len(lbl)])
+                else:
+                    lines.append(_f(body_style, text))
+                    pad = inner_width - len(text)
+                lines.append(_f('', ' ' * max(0, pad)))
+            else:
+                lines.append(_f('', ' ' * inner_width))
+            lines.append(_f(border, ' │\n'))
+
+        # Separator before buttons
+        lines.append(_f(border, '├' + '─' * box_width + '┤\n'))
+
+        # Button row
+        back_label = " ← Back "
+        checkout_label = " Checkout "
+        btn_gap = "    "
+
+        lines.append(_f(border, '│ '))
+        # Center buttons
+        total_btn_width = len(back_label) + len(btn_gap) + len(checkout_label)
+        left_pad = max(1, (inner_width - total_btn_width) // 2)
+        lines.append(_f('', ' ' * left_pad))
+
+        if active_btn == 0:
+            lines.append(_f(btn_active, back_label))
+            lines.append(_f('', btn_gap))
+            lines.append(_f(btn_inactive, checkout_label))
+        else:
+            lines.append(_f(btn_inactive, back_label))
+            lines.append(_f('', btn_gap))
+            lines.append(_f(btn_active, checkout_label))
+
+        right_pad = max(0, inner_width - left_pad - total_btn_width)
+        lines.append(_f('', ' ' * right_pad))
+        lines.append(_f(border, ' │\n'))
+
+        # Hint line
+        hint = "Tab switch  Enter confirm  ↑↓ scroll  Esc back"
+        hint_padded = hint[:inner_width].center(inner_width)
+        lines.append(_f(border, '│ '))
+        lines.append(_f(hint_style, hint_padded))
+        lines.append(_f(border, ' │\n'))
+
+        # Bottom border
+        lines.append(_f(border, '╰' + '─' * box_width + '╯\n'))
+
+        return lines
+
     def _secret_capture_callback(self, var_name: str, prompt: str, metadata=None) -> dict:
         return prompt_for_secret(self, var_name, prompt, metadata)
 
@@ -6345,9 +6894,20 @@ class HermesCLI:
         """Run the interactive CLI loop with persistent input at bottom."""
         self.show_banner()
 
+        # Update checker
+        try:
+            update_cfg = self.config.get("update", {})
+            check_interval = update_cfg.get("check_interval", 3600)
+            if check_interval:  # 0 = disabled
+                from hermes_cli.update_checker import start_update_checker
+                start_update_checker(interval_seconds=int(check_interval))
+        except Exception:
+            pass
+
         # One-line Honcho session indicator (TTY-only, not captured by agent).
         # Only show when the user explicitly configured Honcho for Hermes
         # (not auto-enabled from a stray HONCHO_API_KEY env var).
+        # Start scheduled update checker (configurable interval via update.check_interval)
         try:
             from honcho_integration.client import HonchoClientConfig
             from agent.display import honcho_session_line, write_tty
@@ -6415,6 +6975,9 @@ class HermesCLI:
         self._approval_state = None     # dict with command, description, choices, selected, response_queue
         self._approval_deadline = 0
         self._approval_lock = threading.Lock()  # serialize concurrent approval prompts (delegation race fix)
+
+        # Interactive changelog viewer state
+        self._changelog_state = None    # dict with entries, scroll_offset, visible_rows
 
         # Slash command loading state
         self._command_running = False
@@ -6632,12 +7195,115 @@ class HermesCLI:
                 self._approval_state["selected"] = min(max_idx, self._approval_state["selected"] + 1)
                 event.app.invalidate()
 
+        # --- Interactive changelog viewer: arrow-key + scroll navigation ---
+
+        _changelog_active = Condition(lambda: bool(self._changelog_state))
+        _changelog_list = Condition(lambda: bool(self._changelog_state and self._changelog_state.get("mode") == "list"))
+        _changelog_detail = Condition(lambda: bool(self._changelog_state and self._changelog_state.get("mode") == "detail"))
+
+        @kb.add('up', filter=_changelog_list)
+        def changelog_up(event):
+            self._changelog_move_cursor(-1)
+
+        @kb.add('down', filter=_changelog_list)
+        def changelog_down(event):
+            self._changelog_move_cursor(1)
+
+        @kb.add('up', filter=_changelog_detail)
+        def changelog_detail_up(event):
+            self._changelog_scroll(-1)
+
+        @kb.add('down', filter=_changelog_detail)
+        def changelog_detail_down(event):
+            self._changelog_scroll(1)
+
+        @kb.add('pageup', filter=_changelog_list)
+        def changelog_pgup(event):
+            self._changelog_move_cursor(-10)
+
+        @kb.add('pagedown', filter=_changelog_list)
+        def changelog_pgdn(event):
+            self._changelog_move_cursor(10)
+
+        @kb.add('pageup', filter=_changelog_detail)
+        def changelog_detail_pgup(event):
+            self._changelog_scroll(-10)
+
+        @kb.add('pagedown', filter=_changelog_detail)
+        def changelog_detail_pgdn(event):
+            self._changelog_scroll(10)
+
+        @kb.add('home', filter=_changelog_list)
+        def changelog_home(event):
+            if self._changelog_state:
+                self._changelog_state["cursor"] = 0
+                self._changelog_state["scroll_offset"] = 0
+                self._invalidate(min_interval=0)
+
+        @kb.add('end', filter=_changelog_list)
+        def changelog_end(event):
+            if self._changelog_state:
+                total = len(self._changelog_state["entries"])
+                self._changelog_state["cursor"] = max(0, total - 1)
+                term_rows = shutil.get_terminal_size((100, 20)).lines
+                visible_rows = max(5, min(term_rows - 8, 25))
+                self._changelog_state["scroll_offset"] = max(0, total - visible_rows)
+                self._invalidate(min_interval=0)
+
+        @kb.add('enter', filter=_changelog_list)
+        def changelog_select(event):
+            self._changelog_open_detail()
+
+        @kb.add('enter', filter=_changelog_detail)
+        def changelog_detail_confirm(event):
+            self._changelog_activate_btn()
+
+        @kb.add('left', filter=_changelog_detail, eager=True)
+        @kb.add('right', filter=_changelog_detail, eager=True)
+        def changelog_detail_toggle_btn(event):
+            self._changelog_toggle_btn()
+
+        @kb.add('escape', filter=_changelog_detail, eager=True)
+        def changelog_detail_back(event):
+            self._changelog_close_detail()
+
+        @kb.add('escape', filter=_changelog_list, eager=True)
+        def changelog_close_esc(event):
+            self._close_changelog_viewer()
+
+        @kb.add('q', filter=_changelog_list)
+        def changelog_close_q(event):
+            self._close_changelog_viewer()
+
+        @kb.add('q', filter=_changelog_detail)
+        def changelog_detail_close_q(event):
+            self._changelog_close_detail()
+
+        @kb.add('s-up', filter=_changelog_active)  # Shift+Up = scroll up (alternate)
+        def changelog_shift_up(event):
+            self._changelog_scroll(-3)
+
+        @kb.add('s-down', filter=_changelog_active)  # Shift+Down = scroll down (alternate)
+        def changelog_shift_down(event):
+            self._changelog_scroll(3)
+
+        # Mouse scroll wheel (only active when mouse_support is enabled, i.e. changelog is open)
+        from prompt_toolkit.keys import Keys as _Keys
+
+        @kb.add(_Keys.ScrollUp, filter=_changelog_active)
+        def changelog_scroll_up(event):
+            self._changelog_scroll(-3)
+
+        @kb.add(_Keys.ScrollDown, filter=_changelog_active)
+        def changelog_scroll_down(event):
+            self._changelog_scroll(3)
+
         # --- History navigation: up/down browse history in normal input mode ---
         # The TextArea is multiline, so by default up/down only move the cursor.
         # Buffer.auto_up/auto_down handle both: cursor movement when multi-line,
         # history browsing when on the first/last line (or single-line input).
         _normal_input = Condition(
-            lambda: not self._clarify_state and not self._approval_state and not self._sudo_state and not self._secret_state
+            lambda: not self._clarify_state and not self._approval_state and not self._sudo_state and not self._secret_state and not self._changelog_state
         )
 
         @kb.add('up', filter=_normal_input)
@@ -7298,6 +7964,19 @@ class HermesCLI:
             filter=Condition(lambda: cli_ref._approval_state is not None),
         )
 
+        # --- Interactive changelog viewer widget ---
+
+        def _get_changelog_display():
+            return cli_ref._get_changelog_display_fragments()
+
+        changelog_widget = ConditionalContainer(
+            Window(
+                FormattedTextControl(_get_changelog_display),
+                wrap_lines=False,
+            ),
+            filter=Condition(lambda: cli_ref._changelog_state is not None),
+        )
+
         # Horizontal rules above and below the input (bronze, 1 line each).
         # The bottom rule moves down as the TextArea grows with newlines.
         # Using char='─' instead of hardcoded repetition so the rule
@@ -7408,6 +8087,7 @@ class HermesCLI:
             'status-bar-warn': 'bg:#1a1a2e #FFD700 bold',
             'status-bar-bad': 'bg:#1a1a2e #FF8C00 bold',
             'status-bar-critical': 'bg:#1a1a2e #FF6B6B bold',
+            'status-bar-update': 'bg:#1a1a2e #00BFFF bold',
             # Bronze horizontal rules around the input area
             'input-rule': '#CD7F32',
             # Clipboard image attachment badges
@@ -7437,6 +8117,21 @@ class HermesCLI:
             'approval-cmd': '#AAAAAA italic',
             'approval-choice': '#AAAAAA',
             'approval-selected': '#FFD700 bold',
+            # Interactive changelog viewer
+            'changelog-border': '#CD7F32',
+            'changelog-title': '#00BFFF bold',
+            'changelog-hint': '#555555 italic',
+            'changelog-date': '#888888',
+            'changelog-hash': '#5F87FF',
+            'changelog-subject': '#FFF8DC',
+            'changelog-tag': '#FFD700 bold',
+            'changelog-scrollbar': '#333333',
+            'changelog-scrollbar-thumb': '#CD7F32 bold',
+            'changelog-cursor': 'bg:#2A4A6B #FFFFFF bold',
+            'changelog-detail-label': '#888888',
+            'changelog-detail-value': '#E0E0E0',
+            'changelog-btn-active': 'bg:#4A90D9 #FFFFFF bold',
+            'changelog-btn-inactive': '#666666',
             # Voice mode
             'voice-prompt': '#87CEEB',
             'voice-recording': '#FF4444 bold',
@@ -7452,7 +8147,7 @@ class HermesCLI:
             key_bindings=kb,
             style=style,
             full_screen=False,
-            mouse_support=False,
+            mouse_support=Condition(lambda: bool(self._changelog_state)),
             **({'cursor': _STEADY_CURSOR} if _STEADY_CURSOR is not None else {}),
         )
         self._app = app  # Store reference for clarify_callback

@@ -2890,6 +2890,27 @@ def cmd_update(args):
         managed_error("update Hermes Agent")
         return
     
+
+    # --changelog: show changelog and exit
+    if getattr(args, "changelog", False):
+        from hermes_cli.update_checker import show_changelog
+        show_changelog(limit=40)
+        return
+
+    # --list: list versions
+    if getattr(args, "list", False):
+        from hermes_cli.update_checker import interactive_version_picker, checkout_version
+        selected = interactive_version_picker()
+        if selected:
+            confirm = input(f"  Switch to {selected}? [y/N]: ").strip().lower()
+            if confirm in ("y", "yes"):
+                checkout_version(selected)
+            else:
+                print("  Cancelled.")
+        else:
+            print("  No version selected.")
+        return
+
     print("⚕ Updating Hermes Agent...")
     print()
     
@@ -4882,6 +4903,16 @@ For more help on a command:
         "update",
         help="Update Hermes Agent to the latest version",
         description="Pull the latest changes from git and reinstall dependencies"
+    )
+    update_parser.add_argument(
+        "--changelog", "-c",
+        action="store_true",
+        help="Show the changelog (recent git commits) instead of updating"
+    )
+    update_parser.add_argument(
+        "--pick", "-p",
+        action="store_true",
+        help="Interactive version picker — browse and select a specific version/tag"
     )
     update_parser.set_defaults(func=cmd_update)
     

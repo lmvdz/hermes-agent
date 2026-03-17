@@ -507,6 +507,13 @@ DEFAULT_CONFIG = {
         # ("The agent cannot see this message").  Set to false for clean output.
         "wrap_response": True,
     },
+    
+    # Automatic update checking
+    "update": {
+        "check_interval": 3600,  # Seconds between background update checks (default: 1 hour)
+                                  # Set to 0 to disable automatic checking.
+                                  # Minimum effective value: 60 seconds.
+    },
 
     # Config schema version - bump this when adding new required fields
     "_config_version": 11,
