@@ -3,7 +3,7 @@
 Provides:
 - ``ScheduledUpdateChecker``: background daemon that periodically checks for
   new commits and caches the result; exposes ``update_available`` / ``commits_behind``.
-- ``show_changelog()``: prints a formatted git log between HEAD and origin/main.
+- ``show_changelog()``: prints a formatted git log for the remote branch.
 - ``interactive_version_picker()``: curses-based UI to browse tags/versions and
   check out a specific one with arrow keys + Enter.
 """
@@ -37,6 +37,28 @@ def _get_repo_dir() -> Optional[Path]:
     if (project_root / ".git").exists():
         return project_root
     return None
+
+
+def _get_current_branch(repo_dir: Path) -> str:
+    """Detect the current branch of the repo, falling back to 'main'."""
+    branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], repo_dir, timeout=5)
+    if branch and branch != "HEAD":
+        return branch
+    return "main"
+
+
+def _resolve_remote_branch(repo_dir: Path, branch: Optional[str] = None) -> str:
+    """Resolve the remote branch ref to compare against.
+
+    If *branch* is given explicitly (e.g. ``origin/main``), use it as-is when
+    it already contains a ``/``, otherwise prefix with ``origin/``.
+
+    When *branch* is ``None``, default to ``origin/<current-branch>``.
+    """
+    if branch:
+        return branch if "/" in branch else f"origin/{branch}"
+    current = _get_current_branch(repo_dir)
+    return f"origin/{current}"
 
 
 def _get_cache_file() -> Path:
@@ -121,9 +143,14 @@ class ScheduledUpdateChecker:
         """Signal the checker to stop."""
         self._stop_event.set()
 
-    def check_now(self) -> Optional[int]:
-        """Run an immediate (blocking) check. Returns commits behind or None."""
-        return self._do_check()
+    def check_now(self, branch: Optional[str] = None) -> Optional[int]:
+        """Run an immediate (blocking) check. Returns commits behind or None.
+
+        Args:
+            branch: Optional remote branch to compare against (e.g. ``main``,
+                    ``origin/dev``).  Defaults to ``origin/<current-branch>``.
+        """
+        return self._do_check(branch=branch)
 
     def wait_for_first_check(self, timeout: float = 5.0) -> bool:
         """Block until the first check completes. Returns True if completed."""
@@ -155,7 +182,7 @@ class ScheduledUpdateChecker:
         except Exception:
             pass
 
-    def _do_check(self) -> Optional[int]:
+    def _do_check(self, branch: Optional[str] = None) -> Optional[int]:
         """Perform the actual git check."""
         repo_dir = _get_repo_dir()
         if repo_dir is None:
@@ -165,12 +192,15 @@ class ScheduledUpdateChecker:
         # Fetch latest refs
         _git(["fetch", "origin", "--quiet", "--tags"], repo_dir)
 
-        # Count commits behind origin/main
-        behind_str = _git(["rev-list", "--count", "HEAD..origin/main"], repo_dir, timeout=5)
+        # Resolve which remote branch to compare against
+        remote_ref = _resolve_remote_branch(repo_dir, branch)
+
+        # Count commits behind remote branch
+        behind_str = _git(["rev-list", "--count", f"HEAD..{remote_ref}"], repo_dir, timeout=5)
         behind = int(behind_str) if behind_str and behind_str.isdigit() else None
 
         # Find latest tag
-        latest_tag = _git(["describe", "--tags", "--abbrev=0", "origin/main"], repo_dir, timeout=5)
+        latest_tag = _git(["describe", "--tags", "--abbrev=0", remote_ref], repo_dir, timeout=5)
 
         with self._lock:
             self._commits_behind = behind
@@ -222,8 +252,8 @@ def start_update_checker(interval_seconds: int = 3600):
 # Changelog viewer
 # =========================================================================
 
-def get_changelog_entries(limit: int = 50, skip: int = 0) -> List[dict]:
-    """Get git log entries from origin/main.
+def get_changelog_entries(limit: int = 50, skip: int = 0, branch: Optional[str] = None) -> List[dict]:
+    """Get git log entries from a remote branch.
 
     Returns a list of dicts with keys: hash, short_hash, date, author, subject, tag.
     Commits are returned in reverse chronological order (newest first).
@@ -231,10 +261,13 @@ def get_changelog_entries(limit: int = 50, skip: int = 0) -> List[dict]:
     Args:
         limit: Max entries to return per call.
         skip: Number of commits to skip (for pagination).
+        branch: Remote branch to show log for.  Defaults to ``origin/<current-branch>``.
     """
     repo_dir = _get_repo_dir()
     if repo_dir is None:
         return []
+
+    remote_ref = _resolve_remote_branch(repo_dir, branch)
 
     # Get log with tags decorated, sorted by commit date descending
     fmt = "%H|%h|%ai|%an|%s|%D"
@@ -242,7 +275,7 @@ def get_changelog_entries(limit: int = 50, skip: int = 0) -> List[dict]:
         "log", "--format=" + fmt,
         f"--max-count={limit}",
         "--date-order",
-        "origin/main",
+        remote_ref,
     ]
     if skip > 0:
         args.insert(-1, f"--skip={skip}")
@@ -278,22 +311,28 @@ def get_changelog_entries(limit: int = 50, skip: int = 0) -> List[dict]:
     return entries
 
 
-def get_pending_commits(limit: int = 100) -> List[dict]:
-    """Get commits between HEAD and origin/main (what would be pulled).
+def get_pending_commits(limit: int = 100, branch: Optional[str] = None) -> List[dict]:
+    """Get commits between HEAD and a remote branch (what would be pulled).
 
     Returns a list of dicts with keys: hash, short_hash, date, author, subject, tag.
-    Only returns commits that are on origin/main but not yet on HEAD.
+    Only returns commits that are on the remote branch but not yet on HEAD.
+
+    Args:
+        limit: Max entries to return.
+        branch: Remote branch to compare against.  Defaults to ``origin/<current-branch>``.
     """
     repo_dir = _get_repo_dir()
     if repo_dir is None:
         return []
+
+    remote_ref = _resolve_remote_branch(repo_dir, branch)
 
     fmt = "%H|%h|%ai|%an|%s|%D"
     args = [
         "log", "--format=" + fmt,
         f"--max-count={limit}",
         "--date-order",
-        "HEAD..origin/main",
+        f"HEAD..{remote_ref}",
     ]
     log_output = _git(args, repo_dir, timeout=15)
     if not log_output:
@@ -534,7 +573,7 @@ def get_commit_detail(short_hash: str) -> Optional[dict]:
     }
 
 
-def show_changelog(limit: int = 30, printer=None):
+def show_changelog(limit: int = 30, printer=None, branch: Optional[str] = None):
     """Print a formatted changelog.
 
     Args:
@@ -543,6 +582,8 @@ def show_changelog(limit: int = 30, printer=None):
                  prompt_toolkit TUI, pass ``_cprint`` so ANSI escapes
                  render correctly through patch_stdout.  Defaults to
                  ``print``.
+        branch: Remote branch to show changelog for.  Defaults to
+                ``origin/<current-branch>``.
     """
     # Use raw ANSI codes — hermes_cli.colors.color() checks isatty()
     # which returns False inside the prompt_toolkit TUI.
@@ -551,13 +592,15 @@ def show_changelog(limit: int = 30, printer=None):
 
     out = printer or print
 
-    entries = get_changelog_entries(limit=limit)
+    entries = get_changelog_entries(limit=limit, branch=branch)
     if not entries:
         out(f"{D}  No changelog entries found.{R}")
         return
 
+    repo_dir = _get_repo_dir()
+    remote_ref = _resolve_remote_branch(repo_dir, branch) if repo_dir else "origin/main"
     out("")
-    out(f"{C}{B}  Changelog (origin/main){R}")
+    out(f"{C}{B}  Changelog ({remote_ref}){R}")
     out(f"{D}  {'─' * 56}{R}")
     out("")
 

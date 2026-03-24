@@ -4559,14 +4559,14 @@ class HermesCLI:
     def _handle_update_command(self, cmd: str):
         """Handle /update — check for updates, view changelog, or switch versions.
 
-        Subcommands:
-            /update            — show status + subcommand help
-            /update fetch      — fetch remote, show pending commits
-            /update confirm    — pull + reinstall + restart
-            /update changelog  — show recent changelog entries
-            /update check      — force a fresh update check
-            /update list       — list available tagged versions
-            /update switch <t> — switch to a specific tag
+            /update                  — show status + subcommand help
+            /update fetch [branch]   — fetch remote, show pending commits
+                                       (defaults to origin/<current-branch>)
+            /update confirm          — pull + reinstall + restart
+            /update changelog        — show recent changelog entries
+            /update check            — force a fresh update check
+            /update list             — list available tagged versions
+            /update switch <tag>     — switch to a specific tag
 
         All output goes through ``_cprint`` so ANSI colors render correctly
         inside the prompt_toolkit TUI (raw ``print()`` gets mangled by
@@ -4582,8 +4582,9 @@ class HermesCLI:
         B = "\033[1m"; D = "\033[2m"; R = "\033[0m"
         BLU = "\033[34m"
 
-        parts = cmd.strip().split(maxsplit=1)
-        sub = parts[1].strip().lower() if len(parts) > 1 else ""
+        tokens = cmd.strip().split()
+        sub = tokens[1].lower() if len(tokens) > 1 else ""
+        sub_arg = tokens[2] if len(tokens) > 2 else None  # e.g. branch name
 
         checker = get_update_checker()
 
@@ -4591,25 +4592,32 @@ class HermesCLI:
             self._open_changelog_viewer()
             return
         elif sub == "fetch":
+            branch = sub_arg  # None → auto-detect current branch
             _cprint("")
             _cprint(f"{C}  → Fetching from origin...{R}")
-            behind = checker.check_now()  # does git fetch + count
+            behind = checker.check_now(branch=branch)  # does git fetch + count
             if behind is None:
                 _cprint(f"{Y}  ⚠ Could not fetch (offline or not a git repo).{R}")
                 _cprint("")
                 return
+
+            # Resolve the display label for the remote ref
+            from hermes_cli.update_checker import _get_repo_dir, _resolve_remote_branch
+            repo_dir = _get_repo_dir()
+            remote_ref = _resolve_remote_branch(repo_dir, branch) if repo_dir else "origin/main"
+
             if behind == 0:
-                _cprint(f"{G}  ✓ Already up to date — nothing to pull.{R}")
+                _cprint(f"{G}  ✓ Already up to date with {remote_ref} — nothing to pull.{R}")
                 _cprint("")
                 return
 
             commits_word = "commit" if behind == 1 else "commits"
-            _cprint(f"{Y}  ⬆ {behind} {commits_word} behind origin/main{R}")
+            _cprint(f"{Y}  ⬆ {behind} {commits_word} behind {remote_ref}{R}")
             _cprint("")
 
             # Show the pending commits
             from hermes_cli.update_checker import get_pending_commits
-            pending = get_pending_commits(limit=50)
+            pending = get_pending_commits(limit=50, branch=branch)
             if pending:
                 _cprint(f"{C}{B}  Pending changes:{R}")
                 _cprint(f"{D}  {'─' * 56}{R}")
@@ -4662,7 +4670,10 @@ class HermesCLI:
             behind = checker.check_now()
             if behind and behind > 0:
                 commits_word = "commit" if behind == 1 else "commits"
-                _cprint(f"{Y}  ⬆ {behind} {commits_word} behind origin/main{R}")
+                from hermes_cli.update_checker import _get_repo_dir, _resolve_remote_branch
+                repo_dir = _get_repo_dir()
+                remote_ref = _resolve_remote_branch(repo_dir) if repo_dir else "origin/main"
+                _cprint(f"{Y}  ⬆ {behind} {commits_word} behind {remote_ref}{R}")
                 _cprint(f"{D}    Run /update fetch to see what's new, or /update confirm to update now.{R}")
             elif behind == 0:
                 _cprint(f"{G}  ✓ Already up to date!{R}")
@@ -4691,14 +4702,13 @@ class HermesCLI:
                 _cprint(f"{D}  To switch: /update switch <tag>{R}")
                 _cprint(f"{D}  Example:   /update switch v2026.3.12{R}")
                 _cprint("")
-        elif sub.startswith("switch"):
-            switch_parts = sub.split(maxsplit=1)
-            if len(switch_parts) < 2 or not switch_parts[1].strip():
+        elif sub == "switch":
+            if not sub_arg:
                 _cprint(f"{Y}  Usage: /update switch <tag>{R}")
                 _cprint(f"{D}  Run /update list to see available tagged versions.{R}")
                 _cprint("")
             else:
-                tag = switch_parts[1].strip()
+                tag = sub_arg
                 _cprint("")
                 _cprint(f"{C}  → Switching to {tag}...{R}")
                 success = checkout_version(tag, printer=_cprint)
@@ -4719,7 +4729,7 @@ class HermesCLI:
 
             _cprint("")
             _cprint(f"{C}{B}  Subcommands:{R}")
-            _cprint(f"{D}    /update fetch           Fetch remote + preview pending commits{R}")
+            _cprint(f"{D}    /update fetch [branch]  Fetch remote + preview pending commits{R}")
             _cprint(f"{D}    /update confirm         Pull, reinstall deps, and restart{R}")
             _cprint(f"{D}    /update check           Force a fresh update check{R}")
             _cprint(f"{D}    /update changelog       View interactive commit history{R}")
@@ -6079,7 +6089,10 @@ class HermesCLI:
             return (style, text, _mouse)
 
         # Top border
-        title = " Changelog (origin/main) "
+        from hermes_cli.update_checker import _get_repo_dir, _resolve_remote_branch
+        repo_dir = _get_repo_dir()
+        _remote_ref = _resolve_remote_branch(repo_dir) if repo_dir else "origin/main"
+        title = f" Changelog ({_remote_ref}) "
         pad_left = max(1, (box_width - len(title)) // 2)
         pad_right = max(1, box_width - pad_left - len(title))
         lines.append(_f(border, '╭' + '─' * pad_left))
